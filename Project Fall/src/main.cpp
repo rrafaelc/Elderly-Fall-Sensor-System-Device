@@ -1,4 +1,3 @@
-#include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
@@ -72,18 +71,30 @@ SimpleKalmanFilter kalmanGyroZ(0.1, 1.5, 0.01);
 
 String serialNumber = "123456"; // Substitua pelo número de série real
 
+// Funções de inicialização e configuração
+bool initializeMPU();
+void calibrateSensors();
+void setup_wifi();
+void checkWiFiConnection();
+void setup_mqtt();
+void handleMQTTConnection();
+void reconnect();
 
-// Função para piscar o buzzer e o LED
-void blinkBuzzerAndLED(int times) {
-    for (int i = 0; i < times; i++) {
-        tone(BUZZER_PIN, 1800); // Emite um tom no buzzer
-        digitalWrite(LED_PIN, HIGH); // Liga o LED
-        delay(250); // Mantém o tom e o LED aceso por 250ms
-        noTone(BUZZER_PIN); // Para o tom
-        digitalWrite(LED_PIN, LOW); // Desliga o LED
-        delay(250); // Pausa entre os toques
-    }
-}
+// funções de procesamento e controle
+void handleButtonPress();
+void processSensorData();
+void evaluateFallDetection(float accelTotal, float gyroTotal);
+void sendEventToAPI(const String& eventType, bool isFall, bool isImpact, 
+                    float ax = 0.0, float ay = 0.0, float az = 0.0,
+                    float gx = 0.0, float gy = 0.0, float gz = 0.0);
+void sendEmergencyAlert();
+void sendFallDataToAPI();
+void activateBuzzer();
+void deactivateBuzzer();
+void calculatePerformanceMetrics();
+
+// Funções de utilidade
+void blinkBuzzerAndLED(int times);
 
 void setup() {
     Serial.begin(115200);
@@ -159,6 +170,8 @@ void setup_wifi() {
     Serial.println("Conectado à rede WiFi!");
     Serial.print("Endereço IP: ");
     Serial.println(WiFi.localIP());
+
+    blinkBuzzerAndLED(3);
 }
 
 void checkWiFiConnection() {
@@ -235,7 +248,6 @@ void handleButtonPress() {
     }
 }
 
-
 void processSensorData() {
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
@@ -304,8 +316,8 @@ void evaluateFallDetection(float accelTotal, float gyroTotal) {
 }
 
 void sendEventToAPI(const String& eventType, bool isFall, bool isImpact, 
-                    float ax = 0.0, float ay = 0.0, float az = 0.0,
-                    float gx = 0.0, float gy = 0.0, float gz = 0.0) {
+                    float ax, float ay, float az,
+                    float gx, float gy, float gz) {
     // Verifica se o MQTT está conectado antes de tentar publicar
     if (!client.connected()) {
         Serial.println("MQTT não está conectado. Tentando reconectar...");
@@ -324,12 +336,12 @@ void sendEventToAPI(const String& eventType, bool isFall, bool isImpact,
         doc["is_fall"] = isFall;
         doc["is_impact"] = isImpact;
 
-        JsonObject acceleration = doc.createNestedObject("acceleration");
+        JsonObject acceleration = doc["acceleration"].to<JsonObject>();
         acceleration["ax"] = ax;
         acceleration["ay"] = ay;
         acceleration["az"] = az;
 
-        JsonObject gyroscope = doc.createNestedObject("gyroscope");
+        JsonObject gyroscope = doc["gyroscope"].to<JsonObject>();
         gyroscope["gx"] = gx;
         gyroscope["gy"] = gy;
         gyroscope["gz"] = gz;
@@ -363,7 +375,6 @@ void sendEventToAPI(const String& eventType, bool isFall, bool isImpact,
 }
 
 
-
  // Função para enviar alerta de emergência
 void sendEmergencyAlert() {
     sendEventToAPI("emergencia", false, false);
@@ -372,7 +383,7 @@ void sendEmergencyAlert() {
 // Função para enviar dados de queda
 void sendFallDataToAPI() {
     sendEventToAPI("queda", quedaDetectada, false,
-                  accX, accY, accZ, gyroX, gyroY, gyroZ);
+                accX, accY, accZ, gyroX, gyroY, gyroZ);
 }
 
 
@@ -387,11 +398,23 @@ void deactivateBuzzer() {
     Serial.println("Buzzer desativado!");
 }
 
+// Função para piscar o buzzer e o LED
+void blinkBuzzerAndLED(int times) {
+    for (int i = 0; i < times; i++) {
+        tone(BUZZER_PIN, 1800); // Emite um tom no buzzer
+        digitalWrite(LED_PIN, HIGH); // Liga o LED
+        delay(250); // Mantém o tom e o LED aceso por 250ms
+        noTone(BUZZER_PIN); // Para o tom
+        digitalWrite(LED_PIN, LOW); // Desliga o LED
+        delay(250); // Pausa entre os toques
+    }
+}
+
 void calculatePerformanceMetrics() {
     float precision = (verdadeiroPositivo + falsoPositivo) > 0 
-                      ? (float)verdadeiroPositivo / (verdadeiroPositivo + falsoPositivo) : 0;
+                    ? (float)verdadeiroPositivo / (verdadeiroPositivo + falsoPositivo) : 0;
     float recall = (verdadeiroPositivo + falsoNegativo) > 0 
-                  ? (float)verdadeiroPositivo / (verdadeiroPositivo + falsoNegativo) : 0;
+                ? (float)verdadeiroPositivo / (verdadeiroPositivo + falsoNegativo) : 0;
     float specificity = (verdadeiroNegativo + falsoPositivo) > 0 
                         ? (float)verdadeiroNegativo / (verdadeiroNegativo + falsoPositivo) : 0;
 
@@ -404,21 +427,3 @@ void calculatePerformanceMetrics() {
     Serial.print("Especificidade: "); Serial.println(specificity, 4);
     Serial.print("F1-Score: "); Serial.println(f1Score, 4);
 }
-
-
-// // put function declarations here:
-// int myFunction(int, int);
-
-// void setup() {
-//   // put your setup code here, to run once:
-//   int result = myFunction(2, 3);
-// }
-
-// void loop() {
-//   // put your main code here, to run repeatedly:
-// }
-
-// // put function definitions here:
-// int myFunction(int x, int y) {
-//   return x + y;
-// }
