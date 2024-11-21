@@ -1,42 +1,34 @@
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
-#include <SimpleKalmanFilter.h>
+#include <WiFi.h>
 #include <WiFiManager.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
-#include <TimeLib.h>
-#include <wifi.h>
+#include <Preferences.h>
+#include <SimpleKalmanFilter.h>
+#include <math.h>
 
-// Definindo constantes
-#define BUTTON_PIN 19
+const char* mqtt_server = "maqiatto.com";  // Endereço do broker MQTT
+const int mqtt_port = 1883; // Porta padrão do MQTT
+const char* mqtt_user = "iago.almeida2@fatec.sp.gov.br";  // Usuario do MQTT
+const char* mqtt_password = "S0gek1ng@732";  // Senha do MQTT
+const char* topic_queda = "iago.almeida2@fatec.sp.gov.br/queda/alerta"; // Tópico onde os dados serão publicados
+const char* serialNumber = "ESP32_001";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Pinos para o buzzer e o LED
 #define BUZZER_PIN 5
 #define LED_PIN 4
-#define MPU 0x68
 
-// Variáveis globais
-Adafruit_MPU6050 mpu;
-float accX, accY, accZ, gyroX, gyroY, gyroZ;
+// Pino do botão de emergência
+#define BUTTON_PIN 19
+
+// Variáveis para o controle de queda
 bool quedaDetectada = false;
-
-String lastPublishedStatus = "offline";
-//variavel global tempo
-unsigned long lastFallDetection = 0; // Tempo da última detecção de queda
-
-//Utilize um mecanismo de "debounce" para evitar múltiplas notificações de queda em um curto período.
-const unsigned long debounceTime = 10000; // 10 segundos de debounce
-
-// unsigned long previousMillis = 0;  
-// const long interval = 1000; // Intervalo de atualização de 1 segundo
 int fallCount = 0;
-
-unsigned long lastSensorUpdate = 0; // Armazena o último tempo em que os sensores foram atualizados
-unsigned long sensorUpdateInterval = 100; // ou outro valor que você preferir
-unsigned long loopStartTime = 0; // inicializa para controle de tempo
-
-//controle de intervalo para evitar repetições
-unsigned long lastMQTTPublish = 0;
-const unsigned long mqttPublishInterval = 3000; // Intervalo entre as publicações
 
 // Contadores para avaliação
 int verdadeiroPositivo = 0;
@@ -44,386 +36,376 @@ int falsoPositivo = 0;
 int verdadeiroNegativo = 0;
 int falsoNegativo = 0;
 
-// Variáveis de calibração
+// Variáveis de tempo
+unsigned long lastSensorUpdate = 0; // Armazena o último tempo em que os sensores foram atualizados
+unsigned long sensorUpdateInterval = 50; // Intervalo para a atualização do sensor (em milissegundos)
+
+// Intervalo entre tentativas de reconexão
+const long wifiReconnectInterval = 20000;  // Intervalo de 20 segundos para reconectar ao Wi-Fi
+const long mqttReconnectInterval = 10000;  // Intervalo de 10 segundos para reconectar ao MQTT
+
+unsigned long lastWiFiReconnectTime = 0;  // Armazena o tempo da última tentativa de reconexão Wi-Fi
+unsigned long lastMQTTReconnectTime = 0;  // Armazena o tempo da última tentativa de reconexão MQTT
+
+// Definições do intervalo de amostragem
+const int sampleInterval = 100; // Intervalo de amostragem em milissegundos
+
+// Variáveis para armazenar os valores anteriores (usadas para calcular a variação brusca)
+float prevAccX = 0.0, prevAccY = 0.0, prevAccZ = 0.0;
+float prevGyroX = 0.0, prevGyroY = 0.0, prevGyroZ = 0.0;
+
+// Variáveis para armazenar os offsets dos sensores
 float accOffsetX = 0.0, accOffsetY = 0.0, accOffsetZ = 0.0;
 float gyroOffsetX = 0.0, gyroOffsetY = 0.0, gyroOffsetZ = 0.0;
 
-float thresholdAccel = 1.5;  
-float thresholdGyro = 2.0;
+// Limites para detecção de queda
+const float fallAccelThreshold = 4.0;   // Ajuste para aceleração
+const float fallGyroThreshold = 6.0;    // Ajuste para giroscópio
+const float fallJerkThreshold = 100000.0; // Ajuste para jerk (mudar para um valor menor se muito sensível)
 
-// Definições do servidor MQTT e tópico
-const char* mqtt_server = "maqiatto.com";
-const char* mqtt_username = "iago.almeida2@fatec.sp.gov.br";
-const char* mqtt_password = "S0gek1ng@732";
-const char* topic_queda = "iago.almeida2@fatec.sp.gov.br/queda/alerta";
+Adafruit_MPU6050 mpu;
+Preferences preferences;
 
-WiFiClient espClient;
-PubSubClient client(espClient);
-
-// Criando instâncias do filtro de Kalman
 SimpleKalmanFilter kalmanAccX(0.05, 1.3, 0.01); // (Q, R, P)
 SimpleKalmanFilter kalmanAccY(0.05, 1.3, 0.01);
 SimpleKalmanFilter kalmanAccZ(0.05, 1.3, 0.01);
-SimpleKalmanFilter kalmanGyroX(0.1, 1.5, 0.01);
-SimpleKalmanFilter kalmanGyroY(0.1, 1.5, 0.01);
-SimpleKalmanFilter kalmanGyroZ(0.1, 1.5, 0.01);
 
+SimpleKalmanFilter kalmanGyroX(0.1, 0.2, 0.1);
+SimpleKalmanFilter kalmanGyroY(0.1, 0.2, 0.1);
+SimpleKalmanFilter kalmanGyroZ(0.1, 0.1, 0.1);
 
-String serialNumber = "123456"; // Substitua pelo número de série real
-
-// Funções de inicialização e configuração
-bool initializeMPU();
-void calibrateSensors();
-void setup_wifi();
-void checkWiFiConnection();
-void setup_mqtt();
-void handleMQTTConnection();
-void reconnect();
-
-// funções de procesamento e controle
-void handleButtonPress();
-void processSensorData();
-void evaluateFallDetection(float accelTotal, float gyroTotal);
-void sendEventToAPI(const String& eventType, bool isFall, bool isImpact, 
-                    float ax = 0.0, float ay = 0.0, float az = 0.0,
-                    float gx = 0.0, float gy = 0.0, float gz = 0.0);
-void sendEmergencyAlert();
-void sendFallDataToAPI();
-void activateBuzzer();
-void deactivateBuzzer();
-void calculatePerformanceMetrics();
-
-// Funções de utilidade
-void blinkBuzzerAndLED(int times);
-
-void setup() {
-    Serial.begin(115200);
-    delay(100);
-
-    if (!initializeMPU()) {
-        Serial.println("Falha ao iniciar o MPU6050. Reiniciando...");
-        delay(2000); // Aguarda um momento antes de reiniciar
-        ESP.restart(); // Reinicia o ESP
-    }
-
-    Wire.begin();
-    setup_wifi();
-    setup_mqtt();
-    pinMode(BUTTON_PIN, INPUT_PULLUP);
-    pinMode(BUZZER_PIN, OUTPUT);
-    pinMode(LED_PIN, OUTPUT);
+// Função para piscar o buzzer e LED
+void blinkBuzzerAndLED(int times) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(LED_PIN, HIGH);    // Acende o LED
+    tone(BUZZER_PIN, 1800);         // Emite som de 1800 Hz no buzzer
+    delay(200);                     // Mantém os dois acesos por 200 ms
+    digitalWrite(LED_PIN, LOW);     // Apaga o LED
+    noTone(BUZZER_PIN);             // Desativa o buzzer
+    delay(200);                     // Mantém os dois apagados por 200 ms
+  }
 }
 
-bool initializeMPU() {
-    if (!mpu.begin()) {
-        return false; // Retorna falso se a inicialização falhar
+// Função para reconectar ao MQTT
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Tentando conectar ao MQTT...");
+    if (client.connect("ESP32_FallDetector", mqtt_user, mqtt_password)) {
+      Serial.println("Conectado ao MQTT!");
+    } else {
+      Serial.print("Falha na conexão, rc=");
+      Serial.print(client.state());
+      Serial.println(" Tentando novamente em 5 segundos.");
+      delay(5000);
     }
-
-    mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
-    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-    Serial.println("MPU6050 configurado!");
-
-    calibrateSensors();
-    Serial.println("Calibração concluída!");
-    return true; // Retorna verdadeiro se a inicialização for bem-sucedida
+  }
 }
 
-void calibrateSensors() {
-    sensors_event_t a, g, temp;
-    int samples = 100;
-
-    for (int i = 0; i < samples; i++) {
-        mpu.getEvent(&a, &g, &temp);
-        accOffsetX += a.acceleration.x;
-        accOffsetY += a.acceleration.y;
-        accOffsetZ += (a.acceleration.z - 9.81);
-        gyroOffsetX += g.gyro.x;
-        gyroOffsetY += g.gyro.y;
-        gyroOffsetZ += g.gyro.z;
-        delay(10);
-    }
-
-    accOffsetX /= samples;
-    accOffsetY /= samples;
-    accOffsetZ /= samples;
-    gyroOffsetX /= samples;
-    gyroOffsetY /= samples;
-    gyroOffsetZ /= samples;
-}
-
+// Função para configurar e conectar ao Wi-Fi
 void setup_wifi() {
-    WiFiManager wifiManager; 
-    wifiManager.setTimeout(60); 
+  Serial.begin(115200);
 
-    int attempts = 0; 
-    while (!wifiManager.autoConnect("ESP32-AP") && attempts < 3) {
-        Serial.println("Tentativa de conexão falhou. Tentando novamente...");
+  // Conectar à rede Wi-Fi usando WiFiManager
+  WiFiManager wifiManager;
+  wifiManager.autoConnect("ESP32_FallDetector");
+
+  Serial.println("Conectado ao Wi-Fi!");
+  blinkBuzzerAndLED(3);  // Pisca o buzzer e LED 3 vezes quando conectado ao Wi-Fi
+}
+
+// Função para verificar a conexão Wi-Fi
+void checkWiFiConnection() {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (millis() - lastWiFiReconnectTime >= wifiReconnectInterval) {
+      Serial.println("Wi-Fi desconectado! Tentando reconectar...");
+      setup_wifi();  // Tenta reconectar ao Wi-Fi
+      lastWiFiReconnectTime = millis();
+    }
+  } else {
+    if (millis() - lastWiFiReconnectTime >= wifiReconnectInterval) {
+      Serial.println("Wi-Fi conectado!");
+      lastWiFiReconnectTime = millis();  // Atualiza o tempo da última mensagem
+    }
+  }
+}
+
+// Função para avaliar a detecção de queda
+void evaluateFallDetection() {
+  // Estruturas para armazenar os dados dos sensores
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp); // Obtém os dados do acelerômetro e giroscópio
+
+  // Aceleração (já em g, sem necessidade de dividir por 8192)
+  float accX = a.acceleration.x - accOffsetX;
+  float accY = a.acceleration.y - accOffsetY;
+  float accZ = a.acceleration.z - accOffsetZ;
+
+  // Cálculo de rotação do giroscópio (já em °/s, sem necessidade de dividir por 65.5)
+  float gyroX = g.gyro.x - gyroOffsetX;
+  float gyroY = g.gyro.y - gyroOffsetY;
+  float gyroZ = g.gyro.z - gyroOffsetZ;
+
+
+  // Aplica o filtro de Kalman no acelerômetro
+  accX = kalmanAccX.updateEstimate(accX);
+  accY = kalmanAccY.updateEstimate(accY);
+  accZ = kalmanAccZ.updateEstimate(accZ);
+
+  // Aplica o filtro de Kalman no giroscópio
+  gyroX = kalmanGyroX.updateEstimate(gyroX);
+  gyroY = kalmanGyroY.updateEstimate(gyroY);
+  gyroZ = kalmanGyroZ.updateEstimate(gyroZ);
+
+  // Cálculo da variação brusca (jerk) para detecção de queda
+  float jerkX = (accX - prevAccX) / (sampleInterval / 1000.0);  // Variação de aceleração no eixo X
+  float jerkY = (accY - prevAccY) / (sampleInterval / 1000.0);  // Variação de aceleração no eixo Y
+  float jerkZ = (accZ - prevAccZ) / (sampleInterval / 1000.0);  // Variação de aceleração no eixo Z
+  float jerkTotal = jerkX * jerkX + jerkY * jerkY + jerkZ * jerkZ;  // Magnitude total do jerk
+
+  // Cálculo da aceleração total (magnitude)
+  float accelTotal = sqrt(accX * accX + accY * accY + accZ * accZ) / 9.81;
+  
+  // Cálculo da rotação total do giroscópio (magnitude)
+  float gyroTotal = sqrt(gyroX * gyroX + gyroY * gyroY + gyroZ * gyroZ);
+
+  // Imprime os dados do acelerômetro e giroscópio no monitor serial
+  Serial.print("Aceleração: ");
+
+  Serial.print("AccelX:");
+  Serial.print(accX);
+  Serial.print(",");
+  Serial.print("AccelY:");
+  Serial.print(accY);
+  Serial.print(",");
+  Serial.print("AccelZ:");
+  Serial.print(accZ);
+
+
+  // Serial.print(" | Giroscópio: ");
+
+  // Serial.print("GyroX:");
+  // Serial.print(gyroX);
+  // Serial.print(",");
+  // Serial.print("GyroY:");
+  // Serial.print(gyroY);
+  // Serial.print(",");
+  // Serial.print("GyroZ:");
+  // Serial.print(gyroZ);
+  // Serial.println("");
+
+  Serial.print(" | Aceleração Total (g): ");
+  Serial.print(accelTotal);
+  Serial.print(" | Giroscópio Total (°/s): ");
+  Serial.println(gyroTotal);
+  Serial.print(" | Variação Brusca (jerk): ");
+  Serial.println(jerkTotal);
+
+  // Verificação de queda
+  if (accelTotal > fallAccelThreshold && gyroTotal > fallGyroThreshold && jerkTotal > fallJerkThreshold) {
+    if (!quedaDetectada) {
+      Serial.println("Queda detectada!");
+      quedaDetectada = true;
+      blinkBuzzerAndLED(2);
+      fallCount++;
+      sendEventToAPI("queda", true, false, accX, accY, accZ, gyroX, gyroY, gyroZ);
+      Serial.println("Status enviado!");
+    }
+  } else {
+    quedaDetectada = false;  // Reseta a detecção
+  }
+
+  // Atualiza os valores anteriores de aceleração e giroscópio
+  prevAccX = accX;
+  prevAccY = accY;
+  prevAccZ = accZ;
+  prevGyroX = gyroX;
+  prevGyroY = gyroY;
+  prevGyroZ = gyroZ;
+}
+
+
+// Função para enviar dados para o API MQTT (usada para queda e emergência)
+void sendEventToAPI(const String& eventType, bool isFall, bool isImpact,
+                    float ax, float ay, float az, 
+                    float gx, float gy, float gz) {
+
+  if (!client.connected()) {
+    Serial.println("MQTT não está conectado. Tentando reconectar...");
+    reconnect();
+    if (!client.connected()) {
+      Serial.println("Falha ao conectar ao MQTT, não será possível enviar dados.");
+      return;
+    }
+  }
+
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastMQTTReconnectTime >= 5000) {
+    StaticJsonDocument<256> doc;
+    doc["serial_number"] = "ESP32_001";
+    doc["event_type"] = eventType;
+    doc["is_fall"] = isFall;
+    doc["is_impact"] = isImpact;
+
+    JsonObject acceleration = doc.createNestedObject("acceleration");
+    acceleration["ax"] = ax;
+    acceleration["ay"] = ay;
+    acceleration["az"] = az;
+
+    JsonObject gyroscope = doc.createNestedObject("gyroscope");
+    gyroscope["gx"] = gx;
+    gyroscope["gy"] = gy;
+    gyroscope["gz"] = gz;
+
+    String output;
+    serializeJson(doc, output);
+
+    int attempts = 0;
+    bool published = false;
+    while (attempts < 3 && !published) {
+      if (client.publish(topic_queda, output.c_str())) {
+        Serial.println("Dados enviados com sucesso!");
+        lastMQTTReconnectTime = currentMillis;
+        published = true;
+      } else {
+        Serial.print("Falha ao enviar dados. Tentativa: ");
+        Serial.println(attempts + 1);
         attempts++;
         delay(1000);
+      }
     }
 
-    if (attempts == 3) {
-        Serial.println("Falha ao conectar após 3 tentativas. Reiniciando...");
-        ESP.restart(); 
+    if (!published) {
+      Serial.println("Falha ao enviar dados após várias tentativas.");
     }
-
-    Serial.println("Conectado à rede WiFi!");
-    Serial.print("Endereço IP: ");
-    Serial.println(WiFi.localIP());
-
-    blinkBuzzerAndLED(3);
+  }
 }
 
-void checkWiFiConnection() {
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("WiFi desconectado. Tentando reconectar...");
-        setup_wifi();
+// Função para verificar o botão de emergência
+void checkEmergencyButton() {
+  unsigned long currentMillis = millis();
+  static unsigned long lastButtonPressTime = 0;
+
+  if (digitalRead(BUTTON_PIN) == LOW && (currentMillis - lastButtonPressTime) > 500) {
+    lastButtonPressTime = currentMillis;
+    blinkBuzzerAndLED(1);
+    sendEventToAPI("emergencia", false, false, 0, 0, 0, 0, 0, 0);
+  }
+}
+
+  // void calibrateSensors() {
+  //   sensors_event_t a, g, temp;
+  //   int samples = 100;
+
+  //   for (int i = 0; i < samples; i++) {
+  //       mpu.getEvent(&a, &g, &temp);
+  //       accOffsetX += a.acceleration.x;
+  //       accOffsetY += a.acceleration.y;
+  //       accOffsetZ += (a.acceleration.z - 9.81);
+  //       gyroOffsetX += g.gyro.x;
+  //       gyroOffsetY += g.gyro.y;
+  //       gyroOffsetZ += g.gyro.z;
+  //       delay(10);
+  //   }
+
+  //   accOffsetX /= samples;
+  //   accOffsetY /= samples;
+  //   accOffsetZ /= samples;
+  //   gyroOffsetX /= samples;
+  //   gyroOffsetY /= samples;
+  //   gyroOffsetZ /= samples;
+
+  //   //Salvar os offsets na memória Flash (Preferences)
+  //   preferences.begin("calibration", false);  // "calibration" é o namespace
+  //   preferences.putFloat("accOffsetX", accOffsetX);
+  //   preferences.putFloat("accOffsetY", accOffsetY);
+  //   preferences.putFloat("accOffsetZ", accOffsetZ);
+  //   preferences.putFloat("gyroOffsetX", gyroOffsetX);
+  //   preferences.putFloat("gyroOffsetY", gyroOffsetY);
+  //   preferences.putFloat("gyroOffsetZ", gyroOffsetZ);
+  //   preferences.end();  // Finaliza o uso do namespace
+
+  //   Serial.println("Calibração salva na memória Flash!");
+
+  // }
+
+  void loadCalibrationData() {
+    preferences.begin("calibration", true);  // Abre o armazenamento de preferências para leitura
+    // Carrega os valores de offsets ou usa 0.0 como valor padrão se não existirem
+    accOffsetX = preferences.getFloat("accOffsetX", 0.0);
+    accOffsetY = preferences.getFloat("accOffsetY", 0.0);
+    accOffsetZ = preferences.getFloat("accOffsetZ", 0.0);
+    gyroOffsetX = preferences.getFloat("gyroOffsetX", 0.0);
+    gyroOffsetY = preferences.getFloat("gyroOffsetY", 0.0);
+    gyroOffsetZ = preferences.getFloat("gyroOffsetZ", 0.0);
+    preferences.end();  // Fecha o armazenamento de preferências
+    Serial.println("Dados de calibração carregados.");
+  }
+
+// Função de inicialização do MPU6050
+bool initializeMPU() {
+    if (!mpu.begin()) {
+        // Se falhar na inicialização, retorna false
+        return false;
     }
+    // Configuração do acelerômetro e giroscópio
+    mpu.setAccelerometerRange(MPU6050_RANGE_4_G);  // Faixa de aceleração ±4G
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);       // Faixa de giroscópio ±500°/s
+    
+    // Configuração do filtro passa-alta
+    mpu.setHighPassFilter(MPU6050_HIGHPASS_0_63_HZ);
+    mpu.setMotionDetectionThreshold(1); // Detecta movimento com limiar baixo (sensível)
+    mpu.setMotionDetectionDuration(20); // O movimento deve durar 20ms
+    mpu.setInterruptPinLatch(true);     // Interrupção latente (permanece até ser reiniciada)
+    mpu.setInterruptPinPolarity(true);  // Polaridade da interrupção
+    mpu.setMotionInterrupt(true);       // Habilita interrupção por movimento
+    Serial.println("MPU6050 configurado!");
+
+    // calibrateSensors();
+    loadCalibrationData(); 
+    Serial.println("Calibração concluída!");
+
+    return true;  // Retorna true se a inicialização for bem-sucedida
 }
 
-// <<Config MQTT>>
-void setup_mqtt() {
-    client.setServer(mqtt_server, 1883); 
-    Serial.println("MQTT configurado.");
-}
+void setup() {
+  Serial.begin(115200);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  Wire.begin();
+  setup_wifi();
 
-void handleMQTTConnection() {
-    if (!client.connected()) {
-        Serial.println("Tentando reconectar ao MQTT...");
-        reconnect(); // Tenta reconectar
-    }
-}
+  // Tenta inicializar o MPU6050
+  if (!initializeMPU()) {
+      Serial.println("Falha ao iniciar o MPU6050. Reiniciando...");
+      delay(2000);  // Aguarda 2 segundos antes de reiniciar
+      ESP.restart(); // Reinicia o ESP32
+  }
 
-void reconnect() {
-    while (!client.connected()) {
-        // Serial.print("Tentando conexão MQTT...");
-        if (client.connect("ESP32Client", mqtt_username, mqtt_password)) {
-            Serial.println("Conectado ao broker MQTT!");
-        } else {
-            Serial.print("Falha na conexão. Estado: ");
-            Serial.println(client.state());
-            delay(2000);
-        }
-    }
-}
+  
+  Serial.println("Configuração concluída!");
 
-unsigned long lastPrintTime = 0; // Tempo da última impressão
-const unsigned long printInterval = 2000; // Intervalo de 2 segundos
+  client.setServer(mqtt_server, mqtt_port);
+  // client.setCallback(callback);
+}
 
 void loop() {
-    unsigned long startLoop = millis();
-    checkWiFiConnection();
-    handleMQTTConnection();
-    client.loop();
-    handleButtonPress();
+  checkWiFiConnection();
 
-    unsigned long currentMillis = millis();
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+
+  unsigned long currentMillis = millis();
     if (currentMillis - lastSensorUpdate >= sensorUpdateInterval) {
-        processSensorData();
+        // Avaliar a detecção de queda
+        evaluateFallDetection();
         lastSensorUpdate = currentMillis;
-        calculatePerformanceMetrics();
+        // calculatePerformanceMetrics();
     }
 
-    // Monitorar o tempo de execução do loop
-    unsigned long loopDuration = millis() - loopStartTime;
-    Serial.print("Duração do loop: ");
-    Serial.print(loopDuration);
-    Serial.println(" ms");
-}
-
-void handleButtonPress() {
-    // Publica o estado do botão apenas se a conexão estiver ativa
-    if (digitalRead(BUTTON_PIN) == LOW) {
-        if (client.connected()) {
-            Serial.println("Publicando mensagem de emergência...");
-            sendEmergencyAlert();
-            activateBuzzer();
-            digitalWrite(LED_PIN, HIGH);
-        } else {
-            Serial.println("Conexão MQTT não está ativa. Não é possível publicar emergência.");
-        }
-    } else {
-        deactivateBuzzer();
-        digitalWrite(LED_PIN, LOW);
-    }
-}
-
-void processSensorData() {
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
-
-    accX = a.acceleration.x - accOffsetX;
-    accY = a.acceleration.y - accOffsetY;
-    accZ = a.acceleration.z - accOffsetZ;
-    gyroX = g.gyro.x - gyroOffsetX;
-    gyroY = g.gyro.y - gyroOffsetY;
-    gyroZ = g.gyro.z - gyroOffsetZ;
-
-    accX = kalmanAccX.updateEstimate(accX);
-    accY = kalmanAccY.updateEstimate(accY);
-    accZ = kalmanAccZ.updateEstimate(accZ);
-    gyroX = kalmanGyroX.updateEstimate(gyroX);
-    gyroY = kalmanGyroY.updateEstimate(gyroY);
-    gyroZ = kalmanGyroZ.updateEstimate(gyroZ);
-
-    // Cálculo da aceleração e giroscópio total
-    float accelTotal = sqrt(pow(accX, 2) + pow(accY, 2) + pow(accZ, 2)) / 9.81;
-    float gyroTotal = sqrt(pow(gyroX, 2) + pow(gyroY, 2) + pow(gyroZ, 2));
-
-    // Imprimindo dados
-    Serial.printf("Aceleração: X = %.2f, Y = %.2f, Z = %.2f, Total = %.2f g\n", accX, accY, accZ, accelTotal);
-    Serial.printf("Giroscópio: X = %.2f, Y = %.2f, Z = %.2f, Total = %.2f °/s\n", gyroX, gyroY, gyroZ, gyroTotal);
-
-    // Avaliação da detecção de queda
-    evaluateFallDetection(accelTotal, gyroTotal);
-
-    Serial.print("Aceleração Total "); Serial.print(accelTotal); Serial.println(" g");
-    Serial.print("Gyro Total: "); Serial.print(gyroTotal); Serial.println(" °/s");
-    Serial.printf("Contagem de quedas: %d\n", fallCount);
-    Serial.printf("VP: %d, FP: %d, VN: %d, FN: %d\n", verdadeiroPositivo, falsoPositivo, verdadeiroNegativo, falsoNegativo);
-}
-
-void evaluateFallDetection(float accelTotal, float gyroTotal) {
-    if (accelTotal > thresholdAccel && gyroTotal > thresholdGyro) {
-        if (!quedaDetectada) {
-            Serial.println("Queda detectada!");
-            lastFallDetection = millis();
-            fallCount++;
-            quedaDetectada = true;
-            sendFallDataToAPI();
-            activateBuzzer();
-        }
-        verdadeiroPositivo++;
-    } else if (accelTotal <= thresholdAccel && gyroTotal <= thresholdGyro) {
-        verdadeiroNegativo++;
-        quedaDetectada = false; // Reseta queda detectada
-        deactivateBuzzer();
-    } else {
-        // Apenas um dos dois critérios está acima do limite
-        if (accelTotal > thresholdAccel || gyroTotal > thresholdGyro) {
-            falsoPositivo++;
-            Serial.println("Falso positivo detectado.");
-        } else {
-            falsoNegativo++;
-            Serial.println("Falso negativo detectado.");
-        }
-    }
-
-    // Debounce para queda
-    if (quedaDetectada && (millis() - lastFallDetection >= debounceTime)){
-        quedaDetectada = false; // Reseta a detecção após o debounce
-    }
-}
-
-void sendEventToAPI(const String& eventType, bool isFall, bool isImpact, 
-                    float ax, float ay, float az,
-                    float gx, float gy, float gz) {
-    // Verifica se o MQTT está conectado antes de tentar publicar
-    if (!client.connected()) {
-        Serial.println("MQTT não está conectado. Tentando reconectar...");
-        handleMQTTConnection();
-        if (!client.connected()) {
-            Serial.println("Falha ao conectar ao MQTT, não será possível enviar dados.");
-            return;
-        }
-    }
-
-    unsigned long currentMillis = millis();
-    if (currentMillis - lastMQTTPublish >= mqttPublishInterval) {
-        StaticJsonDocument<256> doc;
-        doc["serial_number"] = serialNumber;
-        doc["event_type"] = eventType;
-        doc["is_fall"] = isFall;
-        doc["is_impact"] = isImpact;
-
-        JsonObject acceleration = doc["acceleration"].to<JsonObject>();
-        acceleration["ax"] = ax;
-        acceleration["ay"] = ay;
-        acceleration["az"] = az;
-
-        JsonObject gyroscope = doc["gyroscope"].to<JsonObject>();
-        gyroscope["gx"] = gx;
-        gyroscope["gy"] = gy;
-        gyroscope["gz"] = gz;
-
-        String output;
-        serializeJson(doc, output);
-
-        const int maxRetries = 3;
-        int attempts = 0;
-        bool published = false;
-
-        while (attempts < maxRetries && !published) {
-            if (client.publish(topic_queda, output.c_str())) {
-                Serial.println("Dados enviados com sucesso!");
-                lastMQTTPublish = currentMillis; // Atualiza o tempo de publicação
-                published = true;
-            } else {
-                Serial.print("Falha ao enviar dados. Tentativa: ");
-                Serial.println(attempts + 1);
-                attempts++;
-                delay(1000); // Aguarda antes de tentar novamente
-            }
-        }
-
-        if (!published) {
-            Serial.println("Falha ao enviar dados após várias tentativas.");
-        }
-    } else {
-        Serial.println("Aguardando para evitar duplicidade de publicações.");
-    }
-}
-
-
- // Função para enviar alerta de emergência
-void sendEmergencyAlert() {
-    sendEventToAPI("emergencia", false, false);
-}
-
-// Função para enviar dados de queda
-void sendFallDataToAPI() {
-    sendEventToAPI("queda", quedaDetectada, false,
-                accX, accY, accZ, gyroX, gyroY, gyroZ);
-}
-
-
-void activateBuzzer() {
-    tone(BUZZER_PIN, 1800);
-    Serial.println("Buzzer ativado!");
-    delay(500);
-}
-
-void deactivateBuzzer() {
-    noTone(BUZZER_PIN);
-    Serial.println("Buzzer desativado!");
-}
-
-// Função para piscar o buzzer e o LED
-void blinkBuzzerAndLED(int times) {
-    for (int i = 0; i < times; i++) {
-        tone(BUZZER_PIN, 1800); // Emite um tom no buzzer
-        digitalWrite(LED_PIN, HIGH); // Liga o LED
-        delay(250); // Mantém o tom e o LED aceso por 250ms
-        noTone(BUZZER_PIN); // Para o tom
-        digitalWrite(LED_PIN, LOW); // Desliga o LED
-        delay(250); // Pausa entre os toques
-    }
-}
-
-void calculatePerformanceMetrics() {
-    float precision = (verdadeiroPositivo + falsoPositivo) > 0 
-                    ? (float)verdadeiroPositivo / (verdadeiroPositivo + falsoPositivo) : 0;
-    float recall = (verdadeiroPositivo + falsoNegativo) > 0 
-                ? (float)verdadeiroPositivo / (verdadeiroPositivo + falsoNegativo) : 0;
-    float specificity = (verdadeiroNegativo + falsoPositivo) > 0 
-                        ? (float)verdadeiroNegativo / (verdadeiroNegativo + falsoPositivo) : 0;
-
-    float f1Score = (precision + recall > 0) 
-                     ? 2 * (precision * recall) / (precision + recall) : 0;
-
-    Serial.println("==== Métricas de Desempenho ====");
-    Serial.print("Precisão: "); Serial.println(precision, 4);
-    Serial.print("Recall: "); Serial.println(recall, 4);
-    Serial.print("Especificidade: "); Serial.println(specificity, 4);
-    Serial.print("F1-Score: "); Serial.println(f1Score, 4);
+  // Verificar botão de emergência
+  checkEmergencyButton();
+  yield();
 }
